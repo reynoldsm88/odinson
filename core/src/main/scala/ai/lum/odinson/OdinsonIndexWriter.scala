@@ -23,6 +23,7 @@ import ai.lum.odinson.lucene.analysis._
 import ai.lum.odinson.digraph.{ DirectedGraph, Vocabulary }
 import ai.lum.odinson.serialization.UnsafeSerializer
 import ai.lum.odinson.utils.IndexSettings
+import ai.lum.odinson.{Document => OdinsonDocument}
 
 class OdinsonIndexWriter(
   val directory: Directory,
@@ -38,22 +39,32 @@ class OdinsonIndexWriter(
   val sortedDocValuesFieldMaxSize: Int,
   val maxNumberOfTokensPerSentence: Int,
   val invalidCharacterReplacement: String,
-  val displayField: String
+  val displayField: String,
+  val appendIndex : Boolean = false
 ) extends LazyLogging {
 
   import OdinsonIndexWriter._
 
   val analyzer = new WhitespaceAnalyzer()
-  val writerConfig = new IndexWriterConfig(analyzer)
-  writerConfig.setOpenMode(OpenMode.CREATE)
+  val writerConfig = {
+    val writerConf = new IndexWriterConfig(analyzer)
+    if (!appendIndex) writerConf.setOpenMode(OpenMode.CREATE)
+    else writerConf.setOpenMode(OpenMode.CREATE_OR_APPEND)
+    writerConf
+  }
   val writer = new IndexWriter(directory, writerConfig)
 
-  def addDocuments(block: Seq[lucenedoc.Document]): Unit = {
-    addDocuments(block.asJava)
+  def addDocument(doc: OdinsonDocument): Unit = {
+    indexDocuments(mkDocumentBlock(doc))
   }
 
-  def addDocuments(block: Collection[lucenedoc.Document]): Unit = {
+  def indexDocuments(block: Seq[lucenedoc.Document]): Unit = {
+    indexDocuments(block.asJava)
+  }
+
+  def indexDocuments(block: Collection[lucenedoc.Document]): Unit = {
     writer.addDocuments(block)
+    if (appendIndex) commit()
   }
 
   /** Add an Odinson Document to the index, where the Document is stored in a File.
@@ -77,19 +88,24 @@ class OdinsonIndexWriter(
         mkDocumentBlock(origDoc)
       }
     // Add the document block
-    addDocuments(block)
+    indexDocuments(block)
   }
 
   def commit(): Unit = writer.commit()
 
   def close(): Unit = {
     // FIXME: is this the correct instantiation of IOContext?
+    if (directory.listAll().contains(VOCABULARY_FILENAME))
     using(directory.createOutput(VOCABULARY_FILENAME, new IOContext)) { stream =>
       stream.writeString(vocabulary.dump)
     }
+
+    if (directory.listAll().contains(BUILDINFO_FILENAME))
     using(directory.createOutput(BUILDINFO_FILENAME, new IOContext)) { stream =>
       stream.writeString(BuildInfo.toJson)
     }
+
+    if (directory.listAll().contains(SETTINGSINFO_FILENAME))
     using(directory.createOutput(SETTINGSINFO_FILENAME, new IOContext)) { stream =>
       stream.writeString(settings.dump)
     }
@@ -282,6 +298,7 @@ object OdinsonIndexWriter {
     }
     // Always store the display field, also store these additional fields
     val settings = IndexSettings(Seq(displayField) ++ storedFields)
+    val append = config[Boolean]("odinson.index.append")
     new OdinsonIndexWriter(
       directory,
       vocabulary,
@@ -296,7 +313,8 @@ object OdinsonIndexWriter {
       sortedDocValuesFieldMaxSize,
       maxNumberOfTokensPerSentence,
       invalidCharacterReplacement,
-      displayField
+      displayField,
+      append
     )
   }
 

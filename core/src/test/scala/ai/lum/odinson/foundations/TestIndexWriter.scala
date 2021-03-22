@@ -2,11 +2,12 @@ package ai.lum.odinson.foundations
 
 // test imports
 import java.nio.file.Files
-
 import ai.lum.odinson.utils.IndexSettings
+import ai.lum.odinson.{DateField, OdinsonIndexWriter, StringField, Document => OdinsonDocument}
 import ai.lum.odinson.utils.TestUtils.OdinsonTest
 import ai.lum.odinson.utils.exceptions.OdinsonException
-import com.typesafe.config.{ Config, ConfigValueFactory }
+import com.typesafe.config.{Config, ConfigValueFactory}
+import org.apache.lucene.index.{DirectoryReader, IndexReader}
 import org.apache.lucene.store.FSDirectory
 
 import scala.collection.JavaConverters.asJavaIterableConverter
@@ -20,38 +21,28 @@ import java.io.File
 class TestOdinsonIndexWriter extends OdinsonTest {
   type Fixture = OdinsonIndexWriter
 
-  val tmpFolder: File = Files.createTempDirectory("odinson-test").toFile()
-  val indexDir = new File(tmpFolder, "index")
-
-  val testConfig: Config = {
-    defaultConfig
-      // re-compute the index and docs path's
-      .withValue(
-        "odinson.indexDir",
-        ConfigValueFactory.fromAnyRef(indexDir.getAbsolutePath)
-      )
-  }
-
-  def deleteIndex = {
+  def deleteIndex(indexDir:File) = {
     val dir = new Directory(indexDir)
     dir.deleteRecursively()
   }
 
-  def getOdinsonIndexWriter: OdinsonIndexWriter = {
-    deleteIndex
+  def getOdinsonIndexWriter(testConfig : Config): OdinsonIndexWriter = {
     OdinsonIndexWriter.fromConfig(testConfig)
   }
 
   "OdinsonIndexWriter" should "object should return index from config correctly" in {
+    val (_, indexDir, config) = mkTestIndex()
     // get index writer
-    val indexWriter = getOdinsonIndexWriter
+    val indexWriter = getOdinsonIndexWriter(config)
     // make sure the folder was created with only the locker inside
     indexWriter.directory.listAll.head should be("write.lock")
     indexWriter.close
+    deleteIndex(indexDir)
   }
 
   it should "mkLuceneFields should convert Fields to lucene.Fields correctly" in {
-    val indexWriter = getOdinsonIndexWriter
+    val (_, indexDir, config) = mkTestIndex()
+    val indexWriter = getOdinsonIndexWriter(config)
     // Initialize fild of type DateField
     var field =
       """{"$type":"ai.lum.odinson.DateField","name":"smth","date":"1993-03-28"}"""
@@ -69,6 +60,8 @@ class TestOdinsonIndexWriter extends OdinsonTest {
     val luceneStringField = indexWriter.mkLuceneFields(stringField)
     luceneStringField.head.name shouldEqual ("smth")
     // TODO: should we test more stuff
+
+    deleteIndex(indexDir)
   }
 
   it should "replace invalid characters prior to indexing to prevent off-by-one errors" in {
@@ -90,9 +83,10 @@ class TestOdinsonIndexWriter extends OdinsonTest {
   }
 
   it should "properly dump and load relevant settings" in {
+    val (tmpFolder, indexDir, config) = mkTestIndex()
     val indexFile = new File(tmpFolder, "index2")
     val customConfig: Config = {
-      testConfig
+      config
         // re-compute the index and docs path's
         .withValue("odinson.indexDir", ConfigValueFactory.fromAnyRef(indexFile.getAbsolutePath))
         .withValue(
@@ -111,6 +105,9 @@ class TestOdinsonIndexWriter extends OdinsonTest {
       "kiwi",
       indexWriter.displayField
     )
+
+    deleteIndex(indexDir)
+    deleteIndex(indexFile)
   }
 
   it should "store stored fields and not others" in {
@@ -127,4 +124,76 @@ class TestOdinsonIndexWriter extends OdinsonTest {
     an[OdinsonException] should be thrownBy ee.getTokensForSpan(0, "entity", 0, 1)
 
   }
+
+  it should "be able to incrementally append to a new index" in {
+    val (_, indexDir, config) = mkTestIndex()
+    val appendConf = config.withValue( "odinson.index.append", ConfigValueFactory.fromAnyRef( true ) )
+    val indexer = getOdinsonIndexWriter( appendConf )
+    var reader : IndexReader = null
+
+    // add one doc...
+    val docOne : OdinsonDocument = getDocument( "alien-species" )
+    indexer.addDocument( docOne )
+
+    reader = DirectoryReader.open( FSDirectory.open( indexDir.toPath ) )
+    reader.numDocs shouldBe 2
+    reader.close()
+
+    val docTwo = getDocument( "ninja-turtles" )
+    indexer.addDocument( docTwo )
+
+    reader = DirectoryReader.open( FSDirectory.open( indexDir.toPath ) )
+    reader.numDocs() shouldBe 5
+
+    reader.close()
+    indexer.close()
+
+    deleteIndex( indexDir )
+  }
+
+  it should "be able to incrementally append to an existing index" in {
+    val (_, indexDir, config) = mkTestIndex()
+    val appendConf = config.withValue( "odinson.index.append", ConfigValueFactory.fromAnyRef( true ) )
+    var indexer = getOdinsonIndexWriter( appendConf )
+    var reader : IndexReader = null
+
+    // add one doc...
+    val docOne : OdinsonDocument = getDocument( "alien-species" )
+    indexer.addDocument( docOne )
+
+    reader = DirectoryReader.open( FSDirectory.open( indexDir.toPath ) )
+
+    reader.numDocs shouldBe 2
+    reader.close()
+    indexer.close()
+
+    // reopen the index with a new processor
+    indexer = getOdinsonIndexWriter( appendConf )
+    reader = DirectoryReader.open( FSDirectory.open( indexDir.toPath ) )
+
+    val docTwo = getDocument( "ninja-turtles" )
+    indexer.addDocument( docTwo )
+
+    reader = DirectoryReader.open( FSDirectory.open( indexDir.toPath ) )
+    reader.numDocs() shouldBe 5
+
+    reader.close()
+    indexer.close()
+
+    deleteIndex( indexDir )
+  }
+
+  private def mkTestIndex( ) : (File, File, Config) = {
+    val tmpFolder : File = Files.createTempDirectory( "odinson-test" ).toFile()
+    val indexDir : File = new File( tmpFolder, "index" )
+    val testConfig : Config = {
+      defaultConfig
+        // re-compute the index and docs path's
+        .withValue(
+          "odinson.indexDir",
+          ConfigValueFactory.fromAnyRef( indexDir.getAbsolutePath ) )
+    }
+    (tmpFolder, indexDir, testConfig)
+  }
+
 }

@@ -656,7 +656,7 @@ object ExtractorEngine {
     // add documents to index
     for (doc <- docs) {
       val block = memWriter.mkDocumentBlock(doc)
-      memWriter.addDocuments(block)
+      memWriter.indexDocuments(block)
     }
     // finalize index writer
     memWriter.commit()
