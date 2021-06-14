@@ -1,6 +1,6 @@
 IMAGE_PREFIX = reynoldsm88
 IMAGE_NAME = odinson-extra
-IMG := $(IMAGE_PREFIX)/$(IMAGE_NAME)
+IMG := $(IMAGE_PREFIX)/$(IMAGE_NAME):latest
 
 docker-build:
 	sbt "project extra" "dist"
