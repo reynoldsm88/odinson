@@ -4,21 +4,17 @@ import ai.lum.common.ConfigFactory
 import ai.lum.common.ConfigUtils._
 import ai.lum.common.DisplayUtils._
 import ai.lum.common.StringUtils._
-import ai.lum.common.TryWithResources.using
-import ai.lum.odinson.digraph.{DirectedGraph, Vocabulary}
-import ai.lum.odinson.lucene.LuceneIndex
+import ai.lum.odinson.digraph.DirectedGraph
 import ai.lum.odinson.lucene.analysis._
+import ai.lum.odinson.lucene.{IncrementalLuceneIndex, LuceneIndex, WriteOnceLuceneIndex}
 import ai.lum.odinson.serialization.UnsafeSerializer
 import ai.lum.odinson.utils.IndexSettings
 import ai.lum.odinson.utils.exceptions.OdinsonException
 import com.typesafe.config.{Config, ConfigValueFactory}
 import com.typesafe.scalalogging.LazyLogging
-import org.apache.lucene.analysis.core.WhitespaceAnalyzer
 import org.apache.lucene.document.BinaryDocValuesField
 import org.apache.lucene.document.Field.Store
-import org.apache.lucene.index.IndexWriterConfig.OpenMode
-import org.apache.lucene.index.{IndexWriter, IndexWriterConfig}
-import org.apache.lucene.store.{Directory, FSDirectory, IOContext, RAMDirectory}
+import org.apache.lucene.store.{FSDirectory, RAMDirectory}
 import org.apache.lucene.util.BytesRef
 import org.apache.lucene.{document => lucenedoc}
 
@@ -29,9 +25,7 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 
 class OdinsonIndexWriter(
-  val directory : Directory,
-  val vocabulary : Vocabulary,
-  val settings : IndexSettings,
+  val luceneIndex : LuceneIndex,
   val documentIdField : String,
   val sentenceIdField : String,
   val sentenceLengthField : String,
@@ -45,15 +39,6 @@ class OdinsonIndexWriter(
   val parentDocFieldType : String,
   val parentDocField : String
 ) extends LazyLogging {
-
-    import ai.lum.odinson.OdinsonIndexWriter._
-
-    val luceneIndex : LuceneIndex = ???
-
-    val analyzer = new WhitespaceAnalyzer()
-    val writerConfig = new IndexWriterConfig( analyzer )
-    writerConfig.setOpenMode( OpenMode.CREATE )
-    val writer = new IndexWriter( directory, writerConfig )
 
     def addDocuments( block : Seq[ lucenedoc.Document ] ) : Unit = {
         addDocuments( block.asJava )
@@ -88,21 +73,7 @@ class OdinsonIndexWriter(
         addDocuments( block )
     }
 
-    def commit( ) : Unit = writer.commit()
-
-    def close( ) : Unit = {
-        // FIXME: is this the correct instantiation of IOContext?
-        using( directory.createOutput( VOCABULARY_FILENAME, new IOContext ) ) { stream =>
-            stream.writeString( vocabulary.dump )
-        }
-        using( directory.createOutput( BUILDINFO_FILENAME, new IOContext ) ) { stream =>
-            stream.writeString( BuildInfo.toJson )
-        }
-        using( directory.createOutput( SETTINGSINFO_FILENAME, new IOContext ) ) { stream =>
-            stream.writeString( settings.dump )
-        }
-        writer.close()
-    }
+    def close( ) : Unit = luceneIndex.close()
 
     /** generates a lucenedoc document per sentence */
     def mkDocumentBlock( d : Document ) : Seq[ lucenedoc.Document ] = {
@@ -177,7 +148,7 @@ class OdinsonIndexWriter(
 
     /** returns a sequence of lucene fields corresponding to the provided odinson field */
     def mkLuceneFields( f : Field ) : Seq[ lucenedoc.Field ] = {
-        val mustStore = settings.storedFields.contains( f.name )
+        val mustStore = luceneIndex.storedFields.contains( f.name )
         f match {
             case f : DateField =>
                 val longField = new lucenedoc.LongPoint( f.name, f.localDate.toEpochDay )
@@ -213,7 +184,7 @@ class OdinsonIndexWriter(
     ) : DirectedGraph = {
         def toLabelIds( tokenEdges : Array[ (Int, String) ] ) : Array[ Int ] = for {
             (tok, label) <- tokenEdges
-            labelId = vocabulary.getOrCreateId( label.normalizeUnicode )
+            labelId = luceneIndex.vocabulary.getOrCreateId( label.normalizeUnicode )
             n <- Array( tok, labelId )
         } yield n
 
@@ -261,28 +232,14 @@ object OdinsonIndexWriter {
     def fromConfig( config : Config ) : OdinsonIndexWriter = {
         // format: off
         val indexDir = config.apply[ String ]( "odinson.indexDir" )
-        val documentIdField = config.apply[ String ]( "odinson.index.documentIdField" )
-        val sentenceIdField = config.apply[ String ]( "odinson.index.sentenceIdField" )
-        val sentenceLengthField = config.apply[ String ]( "odinson.index.sentenceLengthField" )
-        val normalizedTokenField = config.apply[ String ]( "odinson.index.normalizedTokenField" )
-        val addToNormalizedField = config.apply[ List[ String ] ]( "odinson.index.addToNormalizedField" )
-        val incomingTokenField = config.apply[ String ]( "odinson.index.incomingTokenField" )
-        val outgoingTokenField = config.apply[ String ]( "odinson.index.outgoingTokenField" )
-        val maxNumberOfTokensPerSentence = config.apply[ Int ]( "odinson.index.maxNumberOfTokensPerSentence" )
-        val invalidCharacterReplacement = config.apply[ String ]( "odinson.index.invalidCharacterReplacement" )
         val storedFields = config.apply[ List[ String ] ]( "odinson.index.storedFields" )
         val displayField = config.apply[ String ]( "odinson.displayField" )
+        val incrementalIndexing : Boolean = config.apply[ Boolean ]( "odinson.index.incremental" )
         // format: on
-        val (directory, vocabulary) = indexDir match {
-            case ":memory:" =>
-                // memory index is supported in the configuration file
-                val dir = new RAMDirectory
-                val vocab = Vocabulary.empty
-                (dir, vocab)
-            case path =>
-                val dir = FSDirectory.open( Paths.get( path ) )
-                val vocab = Vocabulary.fromDirectory( dir )
-                (dir, vocab)
+
+        val directory = indexDir match {
+            case ":memory:" => new RAMDirectory // memory index is supported in the configuration file
+            case path => FSDirectory.open( Paths.get( path ) )
         }
 
         // Always store the display field, also store these additional fields
@@ -290,12 +247,13 @@ object OdinsonIndexWriter {
             throw new OdinsonException( "`odinson.index.storedFields` must contain `odinson.displayField`" )
         }
         val settings = IndexSettings( storedFields )
-        val luceneIndex : LuceneIndex = ???
+        val luceneIndex : LuceneIndex = {
+            if ( incrementalIndexing ) new IncrementalLuceneIndex( directory, settings, 2000 )
+            else new WriteOnceLuceneIndex( directory, settings )
+        }
+
         new OdinsonIndexWriter(
-            // format: off
-            directory = directory,
-            vocabulary = vocabulary,
-            settings = IndexSettings( storedFields ),
+            luceneIndex = luceneIndex,
             documentIdField = config.apply[ String ]( "odinson.index.documentIdField" ),
             sentenceIdField = config.apply[ String ]( "odinson.index.sentenceIdField" ),
             sentenceLengthField = config.apply[ String ]( "odinson.index.sentenceLengthField" ),
