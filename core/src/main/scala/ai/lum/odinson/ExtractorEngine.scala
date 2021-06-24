@@ -185,12 +185,7 @@ class ExtractorEngine private(
       * @param disableMatchSelector
       * @return
       */
-    def query(
-      odinsonQuery : OdinsonQuery,
-      n : Int,
-      after : OdinsonScoreDoc,
-      disableMatchSelector : Boolean
-    ) : OdinResults = {
+    def query( odinsonQuery : OdinsonQuery, n : Int, after : OdinsonScoreDoc, disableMatchSelector : Boolean ) : OdinResults = {
         val odinResults =
             try {
                 // we may need to read from the state as part of executing the query
