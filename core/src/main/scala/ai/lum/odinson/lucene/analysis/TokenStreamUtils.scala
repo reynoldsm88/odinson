@@ -1,65 +1,23 @@
 package ai.lum.odinson.lucene.analysis
 
-import ai.lum.odinson.utils.exceptions.OdinsonException
+import ai.lum.odinson.lucene.LuceneIndex
+import org.apache.lucene.document.Document
+import org.apache.lucene.index.IndexReader
 
 import scala.collection.JavaConverters._
-import scala.collection.mutable.ArrayBuffer
-import org.apache.lucene.analysis.Analyzer
-import org.apache.lucene.analysis.TokenStream
-import org.apache.lucene.analysis.tokenattributes.CharTermAttribute
-import org.apache.lucene.document.Document
-import org.apache.lucene.index.{ Fields, IndexReader }
-import org.apache.lucene.search.highlight.TokenSources
 
 object TokenStreamUtils {
 
-  def getDoc(docID: Int, fieldNames: Set[String], indexReader: IndexReader): Document = {
-    indexReader.document(docID, fieldNames.asJava)
-  }
-
-  def getTokensFromMultipleFields(
-    docID: Int,
-    fieldNames: Set[String],
-    indexReader: IndexReader,
-    analyzer: Analyzer
-  ): Map[String, Array[String]] = {
-    val doc = getDoc(docID, fieldNames, indexReader)
-    val tvs = indexReader.getTermVectors(docID)
-    fieldNames
-      .map(field => (field, getTokens(doc, tvs, field, analyzer)))
-      .toMap
-  }
-
-  def getTokens(
-    doc: Document,
-    tvs: Fields,
-    fieldName: String,
-    analyzer: Analyzer
-  ): Array[String] = {
-    val field = doc.getField(fieldName)
-    if (field == null) throw new OdinsonException(
-      s"Attempted to getTokens from field that was not stored: $fieldName"
-    )
-    val text = field.stringValue
-    val ts = TokenSources.getTokenStream(fieldName, tvs, text, analyzer, -1)
-    val tokens = getTokens(ts)
-    tokens
-  }
-
-  def getTokens(ts: TokenStream): Array[String] = {
-    ts.reset()
-    val terms = new ArrayBuffer[String]
-
-    while (ts.incrementToken()) {
-      val charTermAttribute = ts.addAttribute(classOf[CharTermAttribute])
-      val term = charTermAttribute.toString
-      terms += term
+    def getDoc( docID : Int, fieldNames : Set[ String ], indexReader : IndexReader ) : Document = {
+        indexReader.document( docID, fieldNames.asJava )
     }
 
-    ts.end()
-    ts.close()
-
-    terms.toArray
-  }
+    def getTokensFromMultipleFields( docID : Int, fieldNames : Set[ String ], luceneIndex : LuceneIndex ) : Map[ String, Array[ String ] ] = {
+        val doc = luceneIndex.doc( docID, fieldNames )
+        val termVectors = luceneIndex.getTermVectors( docID )
+        fieldNames
+          .map( field => (field, luceneIndex.getTokens( doc, termVectors, field )) )
+          .toMap
+    }
 
 }

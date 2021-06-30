@@ -43,17 +43,15 @@ class ExtractorEngine private(
         false -> { mention : Mention =>
             // If needed, filter results to discard trigger overlaps.
             mention.odinsonMatch match {
-                case eventMatch : EventMatch =>
-                    eventMatch.removeTriggerOverlaps.map( eventMatch =>
-                                                              mention.copy( odinsonMatch = eventMatch )
-                                                          )
+                case eventMatch : EventMatch => {
+                    eventMatch.removeTriggerOverlaps.map( eventMatch => mention.copy( odinsonMatch = eventMatch ) )
+                }
                 case _ => Some( mention )
             }
         },
         true -> { mention : Mention =>
             Some( mention )
-        }
-        )
+        } )
 
     /** Gets a lucene document id and returns the stored fields
       * corresponding to that document.
@@ -198,6 +196,25 @@ class ExtractorEngine private(
             }
         // return results
         odinResults
+    }
+
+    private def odinSearch( after : OdinsonScoreDoc,
+                            query : OdinsonQuery,
+                            numHits : Int,
+                            disableMatchSelector : Boolean ) : OdinResults = {
+
+        // val limit = math.max( 1, readerContext.reader().maxDoc() )
+        val limit = math.max( 1, 10000 ) // TODO @michael - need to reimplmenet the orignal behavior above
+
+        require(
+            after == null || after.doc < limit,
+            s"after.doc exceeds the number of documents in the reader: after.doc=${after.doc} limit=${limit}"
+            )
+
+        val cappedNumHits = math.min( numHits, limit )
+        val manager = new OdinsonCollectorManager( after, cappedNumHits, luceneIndex.computeTotalHits, disableMatchSelector )
+
+        luceneIndex.search( query, manager )
     }
 
     // FIXME rewrite this
@@ -650,16 +667,12 @@ object ExtractorEngine {
         fromDirectory( config, indexDir, indexSearcher )
     }
 
-    def fromDirectory(
-      config : Config,
-      indexDir : Directory,
-      indexSearcher : OdinsonIndexSearcher
-    ) : ExtractorEngine = {
+    def fromDirectory( config : Config, luceneIndex : LuceneIndex ) : ExtractorEngine = {
         val displayField = config.apply[ String ]( "odinson.displayField" )
-        val dataGatherer = DataGatherer( indexSearcher.getIndexReader, displayField, indexDir )
-        val vocabulary = Vocabulary.fromDirectory( indexDir )
+        val dataGatherer = DataGatherer( displayField, luceneIndex )
+        val vocabulary = Vocabulary.fromDirectory( luceneIndex.directory )
         val compiler = QueryCompiler( config, vocabulary )
-        val state = State( config, indexSearcher, indexDir )
+        val state = State( config, luceneIndex )
         val parentDocIdField = config.apply[ String ]( "odinson.index.documentIdField" )
         new ExtractorEngine(
             indexSearcher,

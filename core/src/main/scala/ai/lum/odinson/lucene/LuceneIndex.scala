@@ -3,32 +3,35 @@ package ai.lum.odinson.lucene
 import ai.lum.common.TryWithResources.using
 import ai.lum.odinson.BuildInfo
 import ai.lum.odinson.digraph.Vocabulary
-import ai.lum.odinson.lucene.search.OdinsonIndexSearcher
 import ai.lum.odinson.utils.IndexSettings
-import org.apache.lucene.analysis.Analyzer
+import ai.lum.odinson.utils.exceptions.OdinsonException
 import org.apache.lucene.analysis.core.WhitespaceAnalyzer
-import org.apache.lucene.document.{Document => LuceneDocument}
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute
+import org.apache.lucene.analysis.{Analyzer, TokenStream}
+import org.apache.lucene.document.{Document, Document => LuceneDocument}
 import org.apache.lucene.index.IndexWriterConfig.OpenMode
-import org.apache.lucene.index.{DirectoryReader, IndexReader, IndexWriter, IndexWriterConfig}
-import org.apache.lucene.search.{IndexSearcher, Query, SearcherManager, TopDocs}
+import org.apache.lucene.index.{Fields, IndexWriter, IndexWriterConfig}
+import org.apache.lucene.search.highlight.TokenSources
+import org.apache.lucene.search.{CollectorManager, IndexSearcher, Query, SearcherManager, TopDocs}
 import org.apache.lucene.store.{Directory, IOContext}
 import org.slf4j.{Logger, LoggerFactory}
 
-import java.io.IOException
+import scala.collection.JavaConverters._
+import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success}
 
 trait LuceneIndex {
+
+    val computeTotalHits : Boolean
+
     protected val VOCABULARY_FILENAME = "dependencies.txt"
     protected val BUILDINFO_FILENAME = "buildinfo.json"
     protected val SETTINGSINFO_FILENAME = "settingsinfo.json"
 
-    protected val directory : Directory
-
-    protected val settings : IndexSettings
-    protected val analyzer : Analyzer = new WhitespaceAnalyzer
-
-    protected val computeTotalHits : Boolean = true
+    val directory : Directory
+    val settings : IndexSettings
+    val analyzer : Analyzer = new WhitespaceAnalyzer
 
     val storedFields : Seq[ String ] = settings.storedFields
     val vocabulary = Vocabulary.fromDirectory( directory )
@@ -37,9 +40,17 @@ trait LuceneIndex {
 
     def search( query : Query, limit : Int = 1000000000 ) : TopDocs
 
+    def search[ CollectorType, ResultType ]( query : Query, manager : CollectorManager[ CollectorType, ResultType ] ) : ResultType
+
     def numDocs( ) : Int
 
     def doc( docId : Int ) : LuceneDocument
+
+    def doc( docID : Int, fieldNames : Set[ String ] ) : LuceneDocument
+
+    def getTermVectors( docId : Int ) : Fields
+
+    def getTokens( doc : Document, termVectors : Fields, fieldName : String ) : Array[ String ]
 
     def refresh( ) : Unit
 
@@ -65,52 +76,9 @@ trait LuceneIndex {
 
 }
 
-class WriteOnceLuceneIndex( override protected val directory : Directory,
-                            override protected val settings : IndexSettings ) extends LuceneIndex {
-
-    private val LOG : Logger = LoggerFactory.getLogger( getClass )
-
-    private var isOpen : Boolean = true
-    private lazy val reader : IndexReader = DirectoryReader.open( directory )
-    private lazy val searcher : IndexSearcher = new OdinsonIndexSearcher( reader, computeTotalHits )
-    private lazy val writer : IndexWriter = {
-        val config = new IndexWriterConfig( this.analyzer )
-        config.setOpenMode( OpenMode.CREATE )
-        new IndexWriter( this.directory, config )
-    }
-
-    override def write( block : java.util.Collection[ LuceneDocument ] ) : Unit = {
-        writer.addDocuments( block )
-    }
-
-    override def search( query : Query, limit : Int ) : TopDocs = {
-        if ( !isOpen ) searcher.search( query, limit )
-        else {
-            LOG.error( "you cannot query a WriteOnceIndex while it is still open" )
-            throw new IOException()
-        }
-    }
-
-    override def numDocs( ) : Int = {
-        if ( !isOpen ) reader.numDocs()
-        else {
-            LOG.error( "unable to open IndexReader for `numDocs` while a WriteOnceIndex is still open" )
-            throw new IOException()
-        }
-    }
-
-    override def doc( docId : Int ) : LuceneDocument = ???
-
-    override def refresh( ) : Unit = LOG.warn( "calling `refresh` on a WriteOnceIndex does not do anything" )
-
-    override def close( ) : Unit = {
-        reader.close()
-        isOpen = false
-    }
-}
-
-class IncrementalLuceneIndex( override protected val directory : Directory,
-                              override protected val settings : IndexSettings,
+class IncrementalLuceneIndex( override val directory : Directory,
+                              override val settings : IndexSettings,
+                              override val computeTotalHits : Boolean,
                               protected val refreshMs : Long = 1000 ) extends LuceneIndex {
 
     private val LOG : Logger = LoggerFactory.getLogger( getClass )
@@ -138,12 +106,45 @@ class IncrementalLuceneIndex( override protected val directory : Directory,
         finally releaseSearcher( searcher )
     }
 
+    override def search[ CollectorType, ResultType ]( query : Query, manager : CollectorManager[ CollectorType, ResultType ] ) : ResultType = {
+        var searcher : IndexSearcher = null
+        try {
+            searcher = acquireSearcher()
+            searcher.search[ CollectorType, ResultType ]( query, manager )
+        } catch {
+            case e : Throwable => throw new RuntimeException( "what is the best way to deal with this?" )
+        }
+        finally releaseSearcher( searcher )
+    }
+
     override def write( block : java.util.Collection[ LuceneDocument ] ) : Unit = {
         writer.addDocuments( block )
         refresh()
     }
 
     override def doc( docId : Int ) : LuceneDocument = ???
+
+    def doc( docId : Int, fieldNames : Set[ String ] ) : LuceneDocument = {
+        var searcher : IndexSearcher = null
+        try {
+            searcher = acquireSearcher()
+            searcher.getIndexReader.document( docId, fieldNames.asJava )
+        } catch {
+            case e : Throwable => throw new RuntimeException( "what is the best way to deal with this?" )
+        }
+        finally releaseSearcher( searcher )
+    }
+
+    override def getTermVectors( docId : Int ) : Fields = {
+        var searcher : IndexSearcher = null
+        try {
+            searcher = acquireSearcher()
+            searcher.getIndexReader.getTermVectors( docId )
+        } catch {
+            case e : Throwable => throw new RuntimeException( "what is the best way to deal with this?" )
+        }
+        finally releaseSearcher( searcher )
+    }
 
     override def refresh( ) : Unit = {
         writer.flush()
@@ -178,4 +179,32 @@ class IncrementalLuceneIndex( override protected val directory : Directory,
     }
 
     def close( ) : Unit = {}
+
+    override def getTokens( doc : Document,
+                            termVectors : Fields,
+                            fieldName : String ) : Array[ String ] = {
+
+        val field = doc.getField( fieldName )
+        if ( field == null ) throw new OdinsonException( s"Attempted to getTokens from field that was not stored: $fieldName" )
+        val text = field.stringValue
+        val ts = TokenSources.getTokenStream( fieldName, termVectors, text, analyzer, -1 )
+        val tokens = getTokens( ts )
+        tokens
+    }
+
+    private def getTokens( ts : TokenStream ) : Array[ String ] = {
+        ts.reset()
+        val terms = new ArrayBuffer[ String ]
+
+        while ( ts.incrementToken() ) {
+            val charTermAttribute = ts.addAttribute( classOf[ CharTermAttribute ] )
+            val term = charTermAttribute.toString
+            terms += term
+        }
+
+        ts.end()
+        ts.close()
+
+        terms.toArray
+    }
 }
